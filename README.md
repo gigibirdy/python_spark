@@ -5,8 +5,8 @@ This project is a simple automated ETL pipeline using Python, Apache Spark, and 
 > ![pipeline_architecture](./images/pipeline_architecture.png)
 
 ## Git Workflow
-> ![git_workflow_small](./images/git_workflow_small.png)  
-When passes tests, data pipeline scripts should be merged to main branch🔴. How to? [Git merge specific file from another branch](https://dev.to/alexruzenhack/git-merge-specific-file-from-another-branch-dl). A Lambda function will be invoked when main branch has a push event to copy overwrite these scripts to S3 Bucket A. 
+> ![git_workflow_diagram](./images/git_workflow_diagram.png)  
+When passes tests, data pipeline scripts should be merged to main branch. How to? [Git merge specific file from another branch](https://dev.to/alexruzenhack/git-merge-specific-file-from-another-branch-dl). A Lambda function will be invoked when main branch has a push event to copy overwrite these scripts to S3 Bucket A. 
 
 ## Prerequisites:
 > 1. AWS account
