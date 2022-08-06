@@ -1,0 +1,340 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: CloudFormation Template To Provision The Resources For A Simple Data Pipeline.
+
+Resources:
+  S3BucketA:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+
+  S3BucketB:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+
+  S3BucketLog:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+
+  CodecomFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt CodecomLambdaRole.Arn
+      Code:
+        ZipFile: !Sub
+          - |
+            import json
+            import boto3
+            
+            client_codecom = boto3.client('codecommit')
+            client_s3 = boto3.client('s3')
+            def handler(event, context):
+                response_get_folder = client_codecom.get_folder(
+                    repositoryName='etl',
+                    folderPath='/scripts'
+                )
+                for file in response_get_folder['files']:
+                    file_name = file['relativePath']
+                    response_get_file = client_codecom.get_file(
+                        repositoryName='etl',
+                        filePath='/scripts/{}'.format(file_name)
+                        )
+                    key = 'scripts/{}'.format(file_name)
+                    response_put_obj = client_s3.put_object(Body=response_get_file['fileContent'], Bucket="${TargetArn}", Key=key)
+                print(response_put_obj)
+          - TargetArn: !Ref 'S3BucketA'
+      Runtime: python3.9
+      Timeout: 300
+      Handler: index.handler
+
+  CodecomLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        -
+          arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        -
+          arn:aws:iam::aws:policy/AmazonS3FullAccess
+        -
+          arn:aws:iam::aws:policy/AWSCodeCommitReadOnly
+
+  DDBLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSLambdaInvocation-DynamoDB
+        - arn:aws:iam::aws:policy/service-role/AWSIoTDeviceDefenderPublishFindingsToSNSMitigationAction
+
+  DDBLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt DDBLambdaRole.Arn
+      Code:
+        ZipFile: !Sub
+          - |
+            import json
+            import boto3
+            import re
+
+            def handler(event, context):
+              countInsert = 0
+              countRemove = 0
+              countModify = 0
+              client = boto3.client('sns')
+              tblName = re.search('/\w*/', event['Records'][0]['eventSourceARN']).group()[1:-1]
+              print(event['Records'])
+              for record in event['Records']:
+                if record['eventName'] == 'INSERT':
+                    countInsert += 1
+                elif record['eventName'] == 'REMOVE':
+                    countRemove += 1
+                elif record['eventName'] == 'MODIFY':
+                    countModify += 1
+              response = client.publish(
+                TargetArn="${TargetArn}",
+                Message='Received {} new record(s), deleted {} record(s), and modified {} record(s) from {} table.'.format(countInsert, countRemove, countModify, tblName)
+              )
+              message_id = response['MessageId']
+              return message_id
+          - TargetArn: !Ref 'SNSTopic'
+      Runtime: python3.9
+      Timeout: 300
+      Handler: index.handler
+
+  EventMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 60
+      StartingPosition: LATEST
+      EventSourceArn: !GetAtt CustomerAccountTable.StreamArn
+      FunctionName: !GetAtt DDBLambdaFunction.Arn
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+
+  Subscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: apeng@talentpath.com
+      Protocol: email
+      TopicArn: !Ref 'SNSTopic'
+
+  CustomerAccountTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: CustomerAccount
+      AttributeDefinitions:
+        - AttributeName: AccountNumber
+          AttributeType: S
+        - AttributeName: CreatedAtYear
+          AttributeType: N
+      KeySchema:
+        - AttributeName: AccountNumber
+          KeyType: HASH
+        - AttributeName: CreatedAtYear
+          KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  EMRFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt EMRLambdaRole.Arn
+      Code:
+        ZipFile: !Sub
+          - |
+            import json
+            import boto3
+            def handler(event, context):
+                client = boto3.client('emr')
+                response = client.list_clusters(ClusterStates=['WAITING'])
+                if len(response['Clusters']) > 0:
+                    cluster_id = response['Clusters'][0]['Id']
+                    steps = [
+                        {
+                            "Name": "copy data",
+                            "ActionOnFailure": "CONTINUE",
+                            'HadoopJarStep': {
+                                'Jar': "command-runner.jar",
+                                'Args': ["s3-dist-cp", "--s3Endpoint=s3.amazonaws.com", "--src=s3://${S3BucketBName}/",
+                                         "--dest=hdfs:///"]
+                            }
+                        },
+                        {
+                            "Name": "data transformation",
+                            "ActionOnFailure": "CONTINUE",
+                            'HadoopJarStep': {
+                                'Jar': "command-runner.jar",
+                                'Args': ["spark-submit", "hdfs:///scripts/data_transformation.py"]
+                            }
+                        },
+                        {
+                            "Name": "run hive script",
+                            "ActionOnFailure": "CONTINUE",
+                            'HadoopJarStep': {
+                                'Jar': "s3://us-east-1.elasticmapreduce/libs/script-runner/script-runner.jar",
+                                'Args': ["hdfs:///scripts/hive.sh"]
+                            }
+                        }
+                    ]
+                    action = client.add_job_flow_steps(JobFlowId=cluster_id, Steps=steps)
+                else:
+                    cluster_id = client.run_job_flow(
+                        Name='spark_job_cluster',
+                        LogUri="s3://main-s3bucketlog-e03s6bpupq7q/elasticmapreduce/",
+                        ReleaseLabel='emr-5.32.0',
+                        Instances={
+                            'InstanceGroups': [
+                                {
+                                    'Name': 'Master nodes',
+                                    'Market': 'ON_DEMAND',
+                                    'InstanceRole': 'MASTER',
+                                    'InstanceType': 'm4.large',
+                                    'InstanceCount': 1,
+                                },
+                                {
+                                    'Name': 'Slave nodes',
+                                    'Market': 'ON_DEMAND',
+                                    'InstanceRole': 'CORE',
+                                    'InstanceType': 'm4.large',
+                                    'InstanceCount': 2,
+                                }
+                            ],
+                            'Ec2KeyName': 'first',
+                            'KeepJobFlowAliveWhenNoSteps': True,
+                            'TerminationProtected': False
+                        },
+                        Applications=[
+                        {'Name': 'Spark'},
+                        {'Name': 'hadoop'},
+                        {'Name': 'Hive'},
+                        {'Name': 'Pig'}
+                        ],
+                        VisibleToAllUsers=True,
+                        ServiceRole='EMR_DefaultRole',
+                        JobFlowRole='EMR_EC2_DefaultRole',
+                        Steps=[
+                            {
+                                "Name": "copy scripts",
+                                "ActionOnFailure": "CONTINUE",
+                                'HadoopJarStep': {
+                                    'Jar': "command-runner.jar",
+                                    'Args': ["s3-dist-cp", "--s3Endpoint=s3.amazonaws.com", "--src=s3://${S3BucketAName}/",
+                                             "--dest=hdfs:///"]
+                                }
+                            },
+                            {
+                                "Name": "copy data",
+                                "ActionOnFailure": "CONTINUE",
+                                'HadoopJarStep': {
+                                    'Jar': "command-runner.jar",
+                                    'Args': ["s3-dist-cp", "--s3Endpoint=s3.amazonaws.com", "--src=s3://${S3BucketBName}/",
+                                             "--dest=hdfs:///"]
+                                }
+                            },
+                            {
+                                "Name": "data transformation",
+                                "ActionOnFailure": "CONTINUE",
+                                'HadoopJarStep': {
+                                    'Jar': "command-runner.jar",
+                                    'Args': ["spark-submit", "hdfs:///scripts/data_transformation.py"]
+                                }
+                            },
+                            {
+                                "Name": "run hive script",
+                                "ActionOnFailure": "CONTINUE",
+                                'HadoopJarStep': {
+                                    'Jar': "s3://us-east-1.elasticmapreduce/libs/script-runner/script-runner.jar",
+                                    'Args': ["hdfs:///scripts/hive.sh"]
+                                }
+                            }
+                        ]
+                    )
+                return "Started cluster {}".format(cluster_id)
+          - S3BucketAName: !Ref S3BucketA
+            S3BucketBName: !Ref S3BucketB
+            S3BucketLogName: !Ref S3BucketLog
+      Runtime: python3.9
+      Timeout: 300
+      Handler: index.handler
+
+  EMRLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        -
+          arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        -
+          arn:aws:iam::aws:policy/AmazonS3FullAccess
+        -
+          arn:aws:iam::aws:policy/AmazonElasticMapReduceFullAccess
+        -
+          arn:aws:iam::aws:policy/AmazonEMRFullAccessPolicy_v2
+
+  EMREventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "EMR State Change Event Rule"
+      EventPattern:
+        source:
+          - aws.emr
+        detail-type:
+          - EMR Cluster State Change
+        detail:
+          state:
+            - 'TERMINATED_WITH_ERRORS'
+            - 'WAITING'
+      State: "ENABLED"
+      Targets:
+        - Arn:
+            Ref: "EMRSNSTopic"
+          Id: !GetAtt EMRSNSTopic.TopicName
+
+  EventTopicPolicy:
+    Type: 'AWS::SNS::TopicPolicy'
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sns:Publish'
+            Resource: '*'
+      Topics:
+        - !Ref EMRSNSTopic
+
+  EMRSNSTopic:
+    Type: AWS::SNS::Topic
+
+
+  EMRSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: apeng@talentpath.com
+      Protocol: email
+      TopicArn: !Ref 'EMRSNSTopic'
+
