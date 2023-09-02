@@ -4,10 +4,6 @@ This project is a simple automated ETL pipeline using Python, Apache Spark, and 
 ## Pipeline Architecture:
 > ![pipeline_architecture](./images/pipeline_architecture.png)
 
-## Git Workflow
-> ![git_workflow_diagram](./images/git_workflow_diagram.png)  
-When passes tests, data pipeline scripts should be merged to main branch. How to? [Git merge specific file from another branch](https://dev.to/alexruzenhack/git-merge-specific-file-from-another-branch-dl). A Lambda function will be invoked when main branch has a push event to copy overwrite these scripts to S3 Bucket A. 
-
 ## Prerequisites:
 > 1. AWS account
 >    - region: us-east-1
@@ -45,10 +41,6 @@ When passes tests, data pipeline scripts should be merged to main branch. How to
 
 ## Deployment
 > Only one Cloudformation template is needed for this project. Unfortunately 2 triggers have to be implemented manually after the deployment. One is for feature 5, though this one is understandable, we will have to create repo anyway before deploying. The trigger for feature 1 was to invoke the Lambda function to create EMR cluster once csv files are uploaded to the S3 Bucket B. Due to circular dependency, I was not able to include the notification configuration property under the S3 bucket. See [circular_dependency](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-s3-bucket-notificationconfig.html).
-
-## Caveat
-> There is another data_transformation.py file in test folder in development branch that copies transformational functions from the data_transformation.py file in script folder. Due to the hdfs path that specified in scripts/data_transformation.py, unable to import the file as a Python module and run tests against the functions in it.
-> ![caveat](./images/caveat.png)
 
 ## Clean Up
 > Terminate the EMR cluster   
